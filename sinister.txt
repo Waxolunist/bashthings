@@ -1,0 +1,174 @@
+#!/bin/sh
+
+set -e
+
+help()
+{
+    echo 'sinister is a simple installer for shell scripts.'
+    echo
+    echo 'Usage: sinister -u url [options]'
+    echo
+    echo 'Options:'
+    echo
+    echo '-?,-h,--help: Print this help and exit.'
+    echo '-c,--chmod: The mode to chmod your script. Defaults are a+x and u+x.'
+    echo '-l,--local: The script should be saved for the current user, instead of the entire machine.'
+    echo '-n,--name: The name of the file the script should be saved to. Mandatory if no URL is given.'
+    echo '-o,--output: The output directory the script should be saved to.'
+    echo 'By default this is /usr/local/bin on Unix systems, and C:\Program Files\script on Windows.'
+    echo '-u,--url: The location of the script online. e.g: https://github.com/you/repo/raw/master/script'
+    echo 'If no URL is given the script is read from stdin.'
+}
+
+cygwin()
+{
+    uname | grep -q 'CYGWIN'
+}
+
+mingw()
+{
+    uname | egrep -q 'MINGW|MSYS'
+}
+
+windows()
+{
+    cygwin || mingw
+}
+
+wgetpath()
+{
+    $POWERSHELL "[Environment]::GetEnvironmentVariable('PATH', '$1')"
+}
+
+wsetpath()
+{
+    $POWERSHELL "[Environment]::SetEnvironmentVariable('PATH', '$1', '$2')"
+}
+
+wpwd()
+{
+    $POWERSHELL 'Write-Host -NoNewline $pwd'
+}
+
+convert_to_windows_path()
+{
+    DIRECTORY=$(cd "$(dirname "$1")" && wpwd)
+    echo "$DIRECTORY\\$1"
+}
+
+rerun_as_admin()
+{
+    ESCAPED=
+    for ARG in "$@"
+    do
+        ARG="${ARG/\\/\\\\\\\\\\\\}" # replace \ with \\\\\\
+        ARG="${ARG/\'/\\\'\'}" # replace ' with \''
+        ARG="${ARG/\"/\\\"}" # replace " with \\\"
+        ARG="${ARG/\$/\\\$}" # replace $ with \$
+        ESCAPED+="\"$ARG\" " # quote $ARG to account for whitespace
+    done
+    
+    CURL=$(which curl) # Git Bash has issues with its $PATH as admin
+    SHELL_PATH=$(convert_to_windows_path "$SHELL")
+    
+    # Since we can't pipe to Start-Process from PowerShell,
+    # redirect stdin to a temporary file and grab the script from there.
+    TEMP_SCRIPT_PATH="/tmp/script.$$.$RANDOM"
+    echo "$SCRIPT" > "$TEMP_SCRIPT_PATH"
+    
+    SCRIPT_WINDOWS_PATH=$(convert_to_windows_path "$TEMP_SCRIPT_PATH")
+    
+    exec $POWERSHELL "saps '$SHELL_PATH' '-c ''PATH=\"$PATH\" exec sh <($CURL -sSL http://git.io/sinister) $ESCAPED''' -Verb RunAs -RSI '$SCRIPT_WINDOWS_PATH'"
+}
+
+CHMOD=
+LOCAL='false'
+NAME=
+OUTPUT=
+POWERSHELL='powershell -NoProfile -ExecutionPolicy Bypass'
+URL=
+
+# Test for admin privileges on Windows
+windows && ! net session > /dev/null 2>&1 && rerun_as_admin "$@"
+
+test $# -ne 0
+while [ $# -gt 0 ]
+do
+    case "$1" in
+        '-?'|-h|--help) help; exit 0 ;;
+        -c|--chmod) CHMOD="$2"; shift ;;
+        -l|--local) LOCAL='true' ;;
+        -n|--name) NAME="$2"; shift ;;
+        -o|--output) OUTPUT="$2"; shift ;;
+        -u|--url) URL="$2"; shift ;;
+        *) help 1>&2; exit 1 ;;
+    esac
+    shift
+done
+
+test -z "$CHMOD" && if $LOCAL; then
+    CHMOD='u+x' # Executable for the current user
+else
+    CHMOD='a+x' # Executable for all users
+fi
+
+if [ -z "$URL" ]; then
+    test ! -z "$NAME"
+    SCRIPT=$(cat /dev/stdin) # read from standard input
+else
+    NAME=${URL##*/} # Grab everything after the last /
+    if which curl > /dev/null 2>&1; then
+        SCRIPT=$(curl -sSL "$URL")
+    else # Assume wget is installed
+        SCRIPT=$(wget -q -O - "$URL")
+    fi
+fi
+
+test -z "$OUTPUT" && if $LOCAL; then
+    if mingw; then
+        OUTPUT="$HOME/AppData/Local/$NAME"
+    elif cygwin; then
+        REAL_HOME=$(cygpath -u "$USERPROFILE")
+        OUTPUT="$REAL_HOME/AppData/Local/$NAME"
+    else # Unix
+        OUTPUT=~/bin
+    fi
+else
+    if mingw; then
+        OUTPUT="/c/Program Files/$NAME"
+    elif cygwin; then
+        OUTPUT="/cygdrive/c/Program Files/$NAME"
+    else # Unix
+        OUTPUT='/usr/local/bin'
+    fi
+fi
+
+# Use sudo on Unix
+windows || SUDO='sudo'
+
+# Where the magic happens
+$SUDO mkdir -p "$OUTPUT"
+cd "$OUTPUT"
+echo "$SCRIPT" | $SUDO tee "$NAME" > /dev/null
+$SUDO chmod $CHMOD "$NAME"
+
+# Add $OUTPUT to PATH if it's not in it
+which "$NAME" > /dev/null 2>&1 || if windows; then
+    if $LOCAL; then
+        TARGET='User'
+    else
+        TARGET='Machine'
+    fi
+    CURRENT_PATH=$(wgetpath $TARGET)
+    CURRENT_DIR=$(wpwd)
+    wsetpath "$CURRENT_PATH;$CURRENT_DIR" $TARGET
+else # Unix
+    CONTENTS="export PATH=\"\$PATH:$OUTPUT\""
+    if $LOCAL; then
+        echo "$CONTENTS" >> ~/.profile
+    else
+        sudo echo "$CONTENTS" >> /etc/profile
+    fi
+fi
+
+echo "$NAME was installed successfully."
